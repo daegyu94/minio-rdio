@@ -46,6 +46,7 @@ func (p *parallelWriter) Write(ctx context.Context, blocks [][]byte) error {
 		}
 		wg.Add(1)
 		go func(i int) {
+			//startTS := time.Now()
 			defer wg.Done()
 			var n int
 			n, p.errs[i] = p.writers[i].Write(blocks[i])
@@ -57,6 +58,8 @@ func (p *parallelWriter) Write(ctx context.Context, blocks [][]byte) error {
 			} else {
 				p.writers[i] = nil
 			}
+			//elapsed := time.Since(startTS).Microseconds()
+			//fmt.Println("[INFO] parallelWriter:Write() len(blocks[i]=", len(blocks[i]), "elapsed(us)=", elapsed)
 		}(i)
 	}
 	wg.Wait()
@@ -73,7 +76,7 @@ func (p *parallelWriter) Write(ctx context.Context, blocks [][]byte) error {
 }
 
 // Encode reads from the reader, erasure-encodes the data and writes to the writers.
-func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer, buf []byte, quorum int) (total int64, err error) {
+func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer, buf []byte, quorum int, parityFree bool) (total int64, err error) {
 	writer := &parallelWriter{
 		writers:     writers,
 		writeQuorum: quorum,
@@ -92,8 +95,9 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			// Reached EOF, nothing more to be done.
 			break
 		}
+
 		// We take care of the situation where if n == 0 and total == 0 by creating empty data and parity files.
-		blocks, err = e.EncodeData(ctx, buf[:n])
+		blocks, err = e.EncodeData(ctx, buf[:n], parityFree)
 		if err != nil {
 			logger.LogIf(ctx, err)
 
@@ -109,5 +113,6 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			break
 		}
 	}
+
 	return total, nil
 }

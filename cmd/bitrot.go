@@ -109,6 +109,14 @@ func newBitrotWriter(disk StorageAPI, volume, filePath string, length int64, alg
 	return newWholeBitrotWriter(disk, volume, filePath, algo, shardSize)
 }
 
+func newBitrotWriter2(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64, bucket string, writeOpt RdioWriteOpt) io.Writer {
+	if algo == HighwayHash256S {
+		return newStreamingBitrotWriter2(disk, volume, filePath, length, algo, shardSize, bucket, writeOpt)
+	} else {
+		return newWholeBitrotWriter(disk, volume, filePath, algo, shardSize)
+	}
+}
+
 func newBitrotReader(disk StorageAPI, data []byte, bucket string, filePath string, tillOffset int64, algo BitrotAlgorithm, sum []byte, shardSize int64) io.ReaderAt {
 	if algo == HighwayHash256S {
 		return newStreamingBitrotReader(disk, data, bucket, filePath, tillOffset, algo, shardSize)
@@ -118,6 +126,8 @@ func newBitrotReader(disk StorageAPI, data []byte, bucket string, filePath strin
 
 // Close all the readers.
 func closeBitrotReaders(rs []io.ReaderAt) {
+	//var startTS time.Time
+	//startTS = time.Now()
 	for _, r := range rs {
 		if r != nil {
 			if br, ok := r.(io.Closer); ok {
@@ -125,10 +135,14 @@ func closeBitrotReaders(rs []io.ReaderAt) {
 			}
 		}
 	}
+	//elapsed := time.Since(startTS).Microseconds()
+	//fmt.Println("[INFO] closeBitrotReaders # readers=", len(rs), "elapsed(us)=", elapsed)
 }
 
 // Close all the writers.
 func closeBitrotWriters(ws []io.Writer) {
+	//var startTS time.Time
+	//startTS = time.Now()
 	for _, w := range ws {
 		if w != nil {
 			if bw, ok := w.(io.Closer); ok {
@@ -136,6 +150,8 @@ func closeBitrotWriters(ws []io.Writer) {
 			}
 		}
 	}
+	//elapsed := time.Since(startTS).Microseconds()
+	//fmt.Println("[INFO] closeBitrotWriters # writers=", len(ws), "elapsed(us)=", elapsed)
 }
 
 // Returns hash sum for whole-bitrot, nil for streaming-bitrot.

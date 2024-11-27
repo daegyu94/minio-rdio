@@ -74,15 +74,21 @@ func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int
 
 // EncodeData encodes the given data and returns the erasure-coded data.
 // It returns an error if the erasure coding failed.
-func (e *Erasure) EncodeData(ctx context.Context, data []byte) ([][]byte, error) {
+func (e *Erasure) EncodeData(ctx context.Context, data []byte, parityFree bool) ([][]byte, error) {
 	if len(data) == 0 {
 		return make([][]byte, e.dataBlocks+e.parityBlocks), nil
 	}
+
 	encoded, err := e.encoder().Split(data)
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return nil, err
 	}
+
+	if globalParityFreeWrite && parityFree {
+		return encoded, nil
+	}
+
 	if err = e.encoder().Encode(encoded); err != nil {
 		logger.LogIf(ctx, err)
 		return nil, err
@@ -101,6 +107,7 @@ func (e *Erasure) DecodeDataBlocks(data [][]byte) error {
 			break
 		}
 	}
+
 	if isZero == 0 || isZero == len(data) {
 		// If all are zero, payload is 0 bytes.
 		return nil
@@ -111,6 +118,7 @@ func (e *Erasure) DecodeDataBlocks(data [][]byte) error {
 // DecodeDataAndParityBlocks decodes the given erasure-coded data and verifies it.
 // It returns an error if the decoding failed.
 func (e *Erasure) DecodeDataAndParityBlocks(ctx context.Context, data [][]byte) error {
+	//fmt.Println("DecodeDataAndParityBlocks")
 	if err := e.encoder().Reconstruct(data); err != nil {
 		logger.LogIf(ctx, err)
 		return err
@@ -181,7 +189,7 @@ func erasureSelfTest() {
 			}
 			e, err := NewErasure(context.Background(), int(conf[0]), int(conf[1]), blockSizeV2)
 			failOnErr(err)
-			encoded, err := e.EncodeData(GlobalContext, testData[:])
+			encoded, err := e.EncodeData(GlobalContext, testData[:], false)
 			failOnErr(err)
 			hash := xxhash.New()
 			for i, data := range encoded {

@@ -20,9 +20,11 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/minio/minio/internal/logger"
 )
@@ -119,6 +121,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 	readTriggerCh := make(chan bool, len(p.readers))
 	defer close(readTriggerCh) // close the channel upon return
 
+	//fmt.Println("len(p.readers)=", len(p.readers), "p.dataBlocks=", p.dataBlocks)
 	for i := 0; i < p.dataBlocks; i++ {
 		// Setup read triggers for p.dataBlocks number of reads so that it reads in parallel.
 		readTriggerCh <- true
@@ -161,6 +164,9 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 			}
 			// For the last shard, the shardsize might be less than previous shard sizes.
 			// Hence the following statement ensures that the buffer size is reset to the right size.
+
+			//fmt.Println("[INFO] ReadAt bufIdx=", bufIdx, "p.offset=", p.offset)
+
 			p.buf[bufIdx] = p.buf[bufIdx][:p.shardSize]
 			n, err := rr.ReadAt(p.buf[bufIdx], p.offset)
 			if err != nil {
@@ -203,7 +209,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 
 // Decode reads from readers, reconstructs data if needed and writes the data to the writer.
 // A set of preferred drives can be supplied. In that case they will be used and the data reconstructed.
-func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.ReaderAt, offset, length, totalLength int64, prefer []bool) (written int64, derr error) {
+func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.ReaderAt, offset, length, totalLength int64, prefer []bool, bucket string) (written int64, derr error) {
 	if offset < 0 || length < 0 {
 		logger.LogIf(ctx, errInvalidArgument)
 		return -1, errInvalidArgument
@@ -247,6 +253,10 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 			break
 		}
 
+		var br time.Time
+		if isRegularBucket(bucket) {
+			StartTS(&br)
+		}
 		var err error
 		bufs, err = reader.Read(bufs)
 		if len(bufs) > 0 {
@@ -262,7 +272,13 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 			return -1, err
 		}
 
+		if isRegularBucket(bucket) {
+			EndTS(&br, BR_GET_OBJECT_READ_DATA)
+			StartTS(&br)
+		}
+
 		if err = e.DecodeDataBlocks(bufs); err != nil {
+			fmt.Println("[WARN] DecodeDataBlocks err=", err)
 			logger.LogIf(ctx, err)
 			return -1, err
 		}
@@ -273,6 +289,10 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 		}
 
 		bytesWritten += n
+
+		if isRegularBucket(bucket) {
+			EndTS(&br, BR_GET_OBJECT_DECODE_DATA)
+		}
 	}
 
 	if bytesWritten != length {

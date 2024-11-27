@@ -28,8 +28,10 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"os/user"
 	"path"
+	pathutil "path"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -53,7 +55,8 @@ var errDiskStale = errors.New("disk stale")
 
 // To abstract a disk over network.
 type storageRESTServer struct {
-	storage *xlStorageDiskIDCheck
+	storage      *xlStorageDiskIDCheck
+	socketServer *storageSocketServer
 }
 
 func (s *storageRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
@@ -228,7 +231,14 @@ func (s *storageRESTServer) NSScannerHandler(w http.ResponseWriter, r *http.Requ
 			}
 		}
 	}()
-	usageInfo, err := s.storage.NSScanner(ctx, cache, updates, madmin.HealScanMode(scanMode))
+
+	var usageInfo dataUsageCache
+	if globalParityFreeWrite {
+		usageInfo = dataUsageCache{}
+		err = nil
+	} else {
+		usageInfo, err = s.storage.NSScanner(ctx, cache, updates, madmin.HealScanMode(scanMode))
+	}
 	if err != nil {
 		respW.Flush()
 		resp.CloseWithError(err)
@@ -346,8 +356,46 @@ func (s *storageRESTServer) CreateFileHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	done, body := keepHTTPReqResponseAlive(w, r)
-	done(s.storage.CreateFile(r.Context(), volume, filePath, int64(fileSize), body))
+	if globalIsNvmeofWrite && fileSize != -1 {
+		var res RawIOResponse
+
+		volumeDir, err := s.storage.storage.getVolDir(volume)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to get volume dir, err=", err)
+			s.writeErrorResponse(w, err)
+			return
+		}
+		fullFilePath := pathJoin(volumeDir, filePath)
+		parentFilePath := pathutil.Dir(fullFilePath)
+
+		defer func() {
+			if err != nil {
+				if volume == minioMetaTmpBucket {
+					// only cleanup parent path if the
+					// parent volume name is minioMetaTmpBucket
+					removeAll(parentFilePath)
+				}
+			}
+		}()
+
+		if err = mkdirAll(parentFilePath, 0o777); err != nil {
+			fmt.Println("[ERROR] Failed to create parentFilePath=",
+				parentFilePath, "err=", err)
+			s.writeErrorResponse(w, err)
+			return
+		}
+
+		err = AllocateFileAndGetExtents(fullFilePath, int64(fileSize), &res.Extents)
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+
+		_ = msgp.Encode(w, &res)
+	} else {
+		done, body := keepHTTPReqResponseAlive(w, r)
+		done(s.storage.CreateFile(r.Context(), volume, filePath, int64(fileSize), body, "", RdioWriteOpt{}))
+	}
 }
 
 // DeleteVersion delete updated metadata.
@@ -533,13 +581,62 @@ func (s *storageRESTServer) ReadXLHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	rf, err := s.storage.ReadXL(r.Context(), volume, filePath, readData)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
+	if globalIsNvmeofReadXL && readData && isRegularBucket(volume) {
+		var res RawIOResponse
+		var br time.Time
 
-	logger.LogIf(r.Context(), msgp.Encode(w, &rf))
+		StartTS(&br)
+		metaFilePath := pathJoin(filePath, xlStorageFormatFile)
+
+		volumeDir, err := s.storage.storage.getVolDir(volume)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to get volume dir, err=", err)
+			s.writeErrorResponse(w, err)
+			return
+		}
+		fullFilePath := pathJoin(volumeDir, metaFilePath)
+
+		/* 1. get extents info */
+		_, err = GetExtents(fullFilePath, false, &res.Extents)
+		if err != nil {
+			/* XXX: logic from readRaw() */
+			if err == errFileNotFound {
+				metaFilePath := pathJoin(filePath, xlStorageFormatFileV1)
+				fullFilePath = pathJoin(volumeDir, metaFilePath)
+
+				_, err = GetExtents(fullFilePath, false, &res.Extents)
+				if err != nil {
+					s.writeErrorResponse(w, err)
+					return
+				}
+			} else {
+				s.writeErrorResponse(w, err)
+				return
+			}
+		}
+
+		fileInfo, err := os.Stat(fullFilePath)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to stat file, err=", err)
+			s.writeErrorResponse(w, err)
+			return
+		}
+		res.FileSize = int(fileInfo.Size())
+		res.MTime = fileInfo.ModTime().UTC()
+
+		_ = msgp.Encode(w, &res)
+
+		EndTS(&br, BR_REMOTE_METADATA_READ_SERVER)
+		//fmt.Println("ReadXLHandler [INFO] fullFilePath=", fullFilePath, "fileSize=", res.FileSize)
+	} else {
+		rf, err := s.storage.ReadXL(r.Context(), volume, filePath, readData)
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+
+		logger.LogIf(r.Context(), msgp.Encode(w, &rf))
+	}
 }
 
 // ReadFileHandler - read section of a file.
@@ -597,25 +694,60 @@ func (s *storageRESTServer) ReadFileStreamHandler(w http.ResponseWriter, r *http
 		s.writeErrorResponse(w, err)
 		return
 	}
-	length, err := strconv.Atoi(r.Form.Get(storageRESTLength))
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
 
-	rc, err := s.storage.ReadFileStream(r.Context(), volume, filePath, int64(offset), int64(length))
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-	defer rc.Close()
-
-	w.Header().Set(xhttp.ContentLength, strconv.Itoa(length))
-	if _, err = xioutil.Copy(w, rc); err != nil {
-		if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
-			logger.LogIf(r.Context(), err)
+	if globalIsNvmeofRead && isRegularBucket(volume) {
+		var res RawIOResponse
+		volumeDir, err := s.storage.storage.getVolDir(volume)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to get volume dir, err=", err)
+			s.writeErrorResponse(w, err)
+			return
 		}
-		return
+		fullFilePath := pathJoin(volumeDir, filePath)
+
+		/* 1. get extents info */
+		_, err = GetExtents(fullFilePath, false, &res.Extents)
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+
+		fileInfo, err := os.Stat(fullFilePath)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to stat file, err=", err)
+			s.writeErrorResponse(w, err)
+			return
+		}
+		res.FileSize = int(fileInfo.Size())
+
+		_ = msgp.Encode(w, &res)
+
+		//fmt.Println("[INFO] ReadFileStreamHandler: res=", res)
+	} else {
+		length, err := strconv.Atoi(r.Form.Get(storageRESTLength))
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+
+		//startTS := time.Now()
+
+		rc, err := s.storage.ReadFileStream(r.Context(), volume, filePath, int64(offset), int64(length))
+		if err != nil {
+			s.writeErrorResponse(w, err)
+			return
+		}
+		defer rc.Close()
+
+		w.Header().Set(xhttp.ContentLength, strconv.Itoa(length))
+		if _, err = xioutil.Copy(w, rc); err != nil {
+			if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
+				logger.LogIf(r.Context(), err)
+			}
+			return
+		}
+		//elapsed := time.Since(startTS).Microseconds()
+		//fmt.Println(time.Now(), "[INFO] ReadFileStreamHandler: length=", length, "elapsed(us)=", elapsed)
 	}
 }
 
@@ -703,16 +835,33 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 	encoder.Encode(dErrsResp)
 }
 
+type SlabFilePathPair struct {
+	FilePath string
+	Part     string
+}
+
 // RenameDataHandler - renames a meta object and data dir to destination.
 func (s *storageRESTServer) RenameDataHandler(w http.ResponseWriter, r *http.Request) {
+	var ete time.Time
+	var br time.Time
+	StartTS(&ete)
 	if !s.IsValid(w, r) {
 		return
 	}
 
+	StartTS(&br)
 	srcVolume := r.Form.Get(storageRESTSrcVolume)
 	srcFilePath := r.Form.Get(storageRESTSrcPath)
 	dstVolume := r.Form.Get(storageRESTDstVolume)
 	dstFilePath := r.Form.Get(storageRESTDstPath)
+
+	var obj2slabIdsStr, slabSize, hostName string
+	if globalFileSlabEnable {
+		obj2slabIdsStr = r.Form.Get("obj2slabIdsMap")
+		slabSize = r.Form.Get("slabSize")
+		hostName = r.Form.Get("hostName")
+	}
+	EndTS(&br, BR_RENAMEDATA_SERVER_FORM)
 
 	if r.ContentLength < 0 {
 		s.writeErrorResponse(w, errInvalidArgument)
@@ -724,11 +873,91 @@ func (s *storageRESTServer) RenameDataHandler(w http.ResponseWriter, r *http.Req
 		s.writeErrorResponse(w, err)
 		return
 	}
+	if globalMappingCacheEnable && isRegularBucket(dstVolume) {
+		StartTS(&br)
+		for key, value := range globalRESTClientMap {
+			metaCache := value.rawStorage.metaCache
+			xlKey := pathJoin(dstVolume, dstFilePath)
+			metaCache.Remove(xlKey)
+			if false {
+				fmt.Println("[INFO] RenameDataHandler metaCache Remove key=", key, "xlKey=", xlKey)
+			}
+		}
+		EndTS(&br, BR_RENAMEDATA_SERVER_CACHE)
+	}
 
-	err := s.storage.RenameData(r.Context(), srcVolume, srcFilePath, fi, dstVolume, dstFilePath)
+	//fmt.Println("[INFO] RenameDataHandler", srcVolume, srcFilePath, fi.DataDir)
+
+	if globalFileSlabEnable && slabSize != "" {
+		StartTS(&br)
+
+		var tmpDirPath string
+		volumeDir, err := s.storage.storage.getVolDir(srcVolume)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to get volume dir")
+			return
+		}
+
+		tmpDirPath = pathJoin(volumeDir, srcFilePath, fi.DataDir)
+
+		if err = mkdirAll(tmpDirPath, 0o777); err != nil {
+			fmt.Println("[ERROR] Failed to create tmpDirPath=", tmpDirPath, "err=", err)
+			return
+		}
+
+		obj2slabIdsStr = strings.Trim(obj2slabIdsStr, "[]")
+		stringSlice := strings.Split(obj2slabIdsStr, ",")
+		for i, str := range stringSlice {
+			if str == "0" {
+				continue
+			}
+
+			// XXX: remove str2int conversion
+			stri, _ := strconv.Atoi(str)
+			shardId := strconv.Itoa(stri % numObj2SlabMapShards)
+			slabFilePath := pathJoin(s.storage.storage.diskPath, hostName, slabSize, shardId, str)
+			tmpFilePath := pathJoin(tmpDirPath, "part."+strconv.Itoa(i+1))
+
+			//fmt.Println("[INFO] slabFilePath=", slabFilePath, "tmpFilePath=", tmpFilePath)
+
+			err := os.Rename(slabFilePath, tmpFilePath)
+			if err != nil {
+				fmt.Println("[ERROR] Failed to rename file:", err)
+				return
+			}
+		}
+		EndTS(&br, BR_RENAMEDATA_SERVER_SLAB)
+	}
+
+	StartTS(&br)
+	err := s.storage.RenameData(r.Context(), srcVolume, srcFilePath, fi, dstVolume, dstFilePath, true)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 	}
+	EndTS(&br, BR_RENAMEDATA_SERVER_RENAMEDATA)
+
+	if isRegularBucket(dstVolume) && globalMappingCacheEnable && enableCacheMetaByWrite {
+		var res RawIOResponse
+		dstVolumeDir, _ := s.storage.storage.getVolDir(dstVolume)
+		xlMetaPath := pathJoin(dstVolumeDir, dstFilePath+"/xl.meta")
+
+		_, err := GetExtents(xlMetaPath, false, &res.Extents)
+		if err != nil {
+			return
+		}
+
+		fileInfo, err := os.Stat(xlMetaPath)
+		if err != nil {
+			fmt.Println("[ERROR] Failed to stat file:", err)
+			return
+		}
+
+		res.FileSize = int(fileInfo.Size())
+		res.MTime = fileInfo.ModTime().UTC()
+
+		_ = msgp.Encode(w, &res)
+	}
+	EndTS(&ete, BR_RENAMEDATA_SERVER)
 }
 
 // RenameFileHandler - rename a file.
@@ -1255,6 +1484,8 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 	}
 	wg.Wait()
 
+	globalRESTClientMap = make(map[string]*storageRESTClient)
+
 	for _, setDisks := range storageDisks {
 		for _, storage := range setDisks {
 			if storage == nil {
@@ -1263,8 +1494,11 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 
 			endpoint := storage.Endpoint()
 
+			//fmt.Println("[INFO] registerStorageRESTHandlers, endpoint=", endpoint.String())
 			server := &storageRESTServer{storage: newXLStorageDiskIDCheck(storage)}
 			server.storage.SetDiskID(storage.diskID)
+
+			server.socketServer = registerStorageSocketHandlers(server.storage.storage)
 
 			subrouter := router.PathPrefix(path.Join(storageRESTPrefix, endpoint.Path)).Subrouter()
 

@@ -350,6 +350,25 @@ var (
 	globalObjectPerfUserMetadata = "X-Amz-Meta-Minio-Object-Perf" // Clients can set this to bypass S3 API service freeze. Used by object pref tests.
 
 	// Add new variable global values here.
+	/* TODO: rename NVmeof to Rdio */
+	globalIsNvmeofReadXL     bool
+	globalIsNvmeofRead       bool
+	globalIsNvmeofWrite      bool
+	globalMappingCacheEnable bool
+	globalBreakdownEnable    bool
+
+	globalFileSlabEnable  bool
+	globalMinFileSlabSize int
+	globalMaxFileSlabSize int
+	globalNumFileSlabs    int
+
+	globalIsSDFS bool
+
+	globalParityFreeWrite bool
+
+	globalBufferedIO bool // default is direct io
+
+	globalRESTClientMap map[string]*storageRESTClient
 )
 
 var errSelfTestFailure = errors.New("self test failed. unsafe to start server")

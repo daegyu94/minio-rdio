@@ -73,6 +73,56 @@ var ServerFlags = []cli.Flag{
 		EnvVar: "MINIO_SHUTDOWN_TIMEOUT",
 		Hidden: true,
 	},
+
+	cli.BoolFlag{
+		Name:  "nvmeof-readxl",
+		Usage: "bind true to enable nvmeof-readxl",
+	},
+	cli.BoolFlag{
+		Name:  "nvmeof-read",
+		Usage: "bind true to enable nvmeof-read",
+	},
+	cli.BoolFlag{
+		Name:  "nvmeof-write",
+		Usage: "bind true to enable nvmeof-write",
+	},
+	cli.BoolFlag{
+		Name:  "mapping-cache",
+		Usage: "bind true to enable mapping-cache",
+	},
+	cli.BoolFlag{
+		Name:  "file-slab",
+		Usage: "bind true to enable file-slab",
+	},
+	cli.IntFlag{
+		Name:  "min-file-slab-size",
+		Usage: "",
+	},
+	cli.IntFlag{
+		Name:  "max-file-slab-size",
+		Usage: "",
+	},
+	cli.IntFlag{
+		Name:  "num-file-slabs",
+		Usage: "",
+	},
+
+	cli.BoolFlag{
+		Name:  "sdfs",
+		Usage: "bind true to enable sdfs",
+	},
+	cli.BoolFlag{
+		Name:  "parity-free-write",
+		Usage: "bind true to enable parity-free-write",
+	},
+	cli.BoolFlag{
+		Name:  "buffered-io",
+		Usage: "bind true to enable buffered-io",
+	},
+	cli.BoolFlag{
+		Name:  "breakdown",
+		Usage: "bind true to enable breakdown",
+	},
 }
 
 var serverCmd = cli.Command{
@@ -408,7 +458,7 @@ func serverMain(ctx *cli.Context) {
 
 	// Perform any self-tests
 	bitrotSelfTest()
-	erasureSelfTest()
+	//erasureSelfTest() // daegyu
 	compressSelfTest()
 
 	// Handle all server command args.
@@ -494,6 +544,55 @@ func serverMain(ctx *cli.Context) {
 	}()
 
 	setHTTPServer(httpServer)
+
+	globalIsNvmeofReadXL = ctx.Bool("nvmeof-readxl")
+	logger.Info("[INFO] nvmeof-readxl=%t", globalIsNvmeofReadXL)
+
+	globalIsNvmeofRead = ctx.Bool("nvmeof-read")
+	logger.Info("[INFO] nvmeof-read=%t", globalIsNvmeofRead)
+
+	globalIsNvmeofWrite = ctx.Bool("nvmeof-write")
+	logger.Info("[INFO] nvmeof-write=%t", globalIsNvmeofWrite)
+
+	globalMappingCacheEnable = ctx.Bool("mapping-cache")
+	logger.Info("[INFO] mapping-cache=%t", globalMappingCacheEnable)
+
+	globalBreakdownEnable = ctx.Bool("breakdown")
+	logger.Info("[INFO] breakdown=%t", globalBreakdownEnable)
+
+	globalFileSlabEnable = ctx.Bool("file-slab")
+	logger.Info("[INFO] file-slab=%t", globalFileSlabEnable)
+	globalMinFileSlabSize = ctx.Int("min-file-slab-size")
+	globalMaxFileSlabSize = ctx.Int("max-file-slab-size")
+	globalNumFileSlabs = ctx.Int("num-file-slabs")
+	if globalFileSlabEnable {
+		logger.Info("[INFO] size_kb(min=%d, max=%d), num(k)=%d",
+			globalMinFileSlabSize/1024, globalMaxFileSlabSize/1024, globalNumFileSlabs/1000)
+		if globalMinFileSlabSize == 0 || globalMaxFileSlabSize == 0 || globalNumFileSlabs == 0 {
+			log.Fatalf("Error arguments")
+		}
+		if globalMinFileSlabSize%4096 != 0 || globalMaxFileSlabSize%4096 != 0 {
+			log.Fatalf("Error unaligned file slab size")
+		}
+		if globalMinFileSlabSize > globalMaxFileSlabSize {
+			log.Fatalf("Error min > max")
+		}
+		if globalNumFileSlabs < 1000 {
+			log.Fatalf("Error num slabs < 1000")
+		}
+	}
+
+	globalIsSDFS = ctx.Bool("sdfs")
+	logger.Info("[INFO] sdfs=%t", globalIsSDFS)
+
+	globalParityFreeWrite = ctx.Bool("parity-free-write")
+	if globalIsNvmeofWrite == false {
+		globalParityFreeWrite = false
+	}
+	logger.Info("[INFO] parity-free-write=%t", globalParityFreeWrite)
+
+	globalBufferedIO = ctx.Bool("buffered-io")
+	logger.Info("[INFO] buffered-io=%t", globalBufferedIO)
 
 	if globalIsDistErasure && globalEndpoints.FirstLocal() {
 		// Additionally in distributed setup, validate the setup and configuration.
@@ -619,6 +718,39 @@ func serverMain(ctx *cli.Context) {
 
 		// Prints the formatted startup message, if err is not nil then it prints additional information as well.
 		printStartupMessage(getAPIEndpoints(), err)
+		/* XXX: daegyu: using globalClientMap, init file slab */
+
+		if globalFileSlabEnable {
+			fmt.Println("[INFO] start file slab allocation")
+			startTime := time.Now()
+
+			var wg sync.WaitGroup
+			for _, client := range globalRESTClientMap {
+				wg.Add(1)
+
+				go func(client *storageRESTClient) {
+					defer wg.Done()
+
+					client.fsa = NewFileSlabAllocator()
+
+					client.obj2slabIdsMap = make(map[string]IdSize)
+					client.obj2SlabMap = NewObj2SlabMap()
+					hostname, err := os.Hostname()
+					if err != nil {
+						fmt.Println("[ERROR] Failed to get hostname:", err)
+						return
+					}
+					InitXLRawStorageSlab(hostname, client)
+				}(client)
+			}
+
+			wg.Wait()
+
+			endTime := time.Now()
+			fmt.Printf("[INFO] file slab allocation is done, elapsed=%v\n", endTime.Sub(startTime))
+		}
+
+		fmt.Println("[INFO] server-main init done...!")
 	}()
 
 	if serverDebugLog {

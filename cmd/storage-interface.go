@@ -85,13 +85,13 @@ type StorageAPI interface {
 	UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) error
 	ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (FileInfo, error)
 	ReadXL(ctx context.Context, volume, path string, readData bool) (RawFileInfo, error)
-	RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) error
+	RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, isRemote bool) error
 
 	// File operations.
 	ListDir(ctx context.Context, volume, dirPath string, count int) ([]string, error)
 	ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error)
 	AppendFile(ctx context.Context, volume string, path string, buf []byte) (err error)
-	CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error
+	CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader, bucket string, writeOpt RdioWriteOpt) error
 	ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error)
 	RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error
 	CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error
@@ -107,6 +107,8 @@ type StorageAPI interface {
 	ReadAll(ctx context.Context, volume string, path string) (buf []byte, err error)
 	GetDiskLoc() (poolIdx, setIdx, diskIdx int) // Retrieve location indexes.
 	SetDiskLoc(poolIdx, setIdx, diskIdx int)    // Set location indexes.
+
+	InitStorageSocketClient()
 }
 
 type unrecognizedDisk struct {
@@ -203,7 +205,7 @@ func (p *unrecognizedDisk) AppendFile(ctx context.Context, volume string, path s
 	return errDiskNotFound
 }
 
-func (p *unrecognizedDisk) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error {
+func (p *unrecognizedDisk) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader, bucket string, writeOpt RdioWriteOpt) error {
 	return errDiskNotFound
 }
 
@@ -215,7 +217,7 @@ func (p *unrecognizedDisk) RenameFile(ctx context.Context, srcVolume, srcPath, d
 	return errDiskNotFound
 }
 
-func (p *unrecognizedDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) error {
+func (p *unrecognizedDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, isRemote bool) error {
 	return errDiskNotFound
 }
 
@@ -273,3 +275,5 @@ func (p *unrecognizedDisk) ReadAll(ctx context.Context, volume string, path stri
 func (p *unrecognizedDisk) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
 	return nil, errDiskNotFound
 }
+
+func (d *unrecognizedDisk) InitStorageSocketClient() {}

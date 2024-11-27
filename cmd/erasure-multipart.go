@@ -590,7 +590,7 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 		}
 	}
 
-	n, err := erasure.Encode(pctx, toEncode, writers, buffer, writeQuorum)
+	n, err := erasure.Encode(pctx, toEncode, writers, buffer, writeQuorum, false)
 	closeBitrotWriters(writers)
 	if err != nil {
 		return pi, toObjectErr(err, bucket, object)

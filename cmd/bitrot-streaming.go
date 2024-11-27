@@ -25,6 +25,7 @@ import (
 	"hash"
 	"io"
 	"sync"
+	"time"
 
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
@@ -101,7 +102,40 @@ func newStreamingBitrotWriter(disk StorageAPI, volume, filePath string, length i
 			bitrotSumsTotalSize := ceilFrac(length, shardSize) * int64(h.Size()) // Size used for storing bitrot checksums.
 			totalFileSize = bitrotSumsTotalSize + length
 		}
-		r.CloseWithError(disk.CreateFile(context.TODO(), volume, filePath, totalFileSize, r))
+		r.CloseWithError(disk.CreateFile(context.TODO(), volume, filePath, totalFileSize, r, "",
+			RdioWriteOpt{}))
+		bw.canClose.Done()
+	}()
+	return bw
+}
+
+// Returns streaming bitrot writer implementation.
+func newStreamingBitrotWriter2(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64, bucket string, writeOpt RdioWriteOpt) io.Writer {
+	r, w := io.Pipe()
+	h := algo.New()
+
+	bw := &streamingBitrotWriter{iow: w, closeWithErr: w.CloseWithError, h: h, shardSize: shardSize, canClose: &sync.WaitGroup{}}
+	bw.canClose.Add(1)
+	go func() {
+		totalFileSize := int64(-1) // For compressed objects length will be unknown (represented by length=-1)
+		if length != -1 {
+			bitrotSumsTotalSize := ceilFrac(length, shardSize) * int64(h.Size()) // Size used for storing bitrot checksums.
+			totalFileSize = bitrotSumsTotalSize + length
+		}
+
+		var br time.Time
+		if length != -1 {
+			StartTS(&br)
+		}
+		// daegyu: pass index to identify parity block not to write parity
+		r.CloseWithError(disk.CreateFile(context.TODO(), volume, filePath, totalFileSize, r, bucket, writeOpt))
+		if length != -1 {
+			if disk.IsLocal() {
+				EndTS(&br, BR_CREATE_FILE_LOCAL)
+			} else {
+				EndTS(&br, BR_CREATE_FILE_REMOTE)
+			}
+		}
 		bw.canClose.Done()
 	}()
 	return bw
@@ -173,12 +207,13 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	_, err = io.ReadFull(b.rc, buf)
 	if err != nil {
 		return 0, err
 	}
 	b.h.Write(buf)
-
+	//fmt.Println("[INFO] buf=", buf)
 	if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {
 		logger.LogIf(GlobalContext, fmt.Errorf("Disk: %s  -> %s/%s - content hash does not match - expected %s, got %s",
 			b.disk, b.volume, b.filePath, hex.EncodeToString(b.hashBytes), hex.EncodeToString(b.h.Sum(nil))))

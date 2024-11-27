@@ -26,8 +26,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/url"
+	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,6 +131,38 @@ type storageRESTClient struct {
 
 	diskInfoCache timedValue
 	diskHealCache timedValue
+
+	rawStorage     *xlRawStorage
+	fsa            *FileSlabAllocator
+	obj2slabIdsMap map[string]IdSize // XXX: static allocation
+	obj2SlabMap    *Obj2SlabMap      // XXX: static allocation
+	mu             sync.Mutex
+	sockClient     *storageSocketClient
+}
+
+// String method for storageRESTClient
+func (s *storageRESTClient) String2() string {
+	return fmt.Sprintf(
+		"Endpoint: %+v\nRestClient: %+v\nDiskID: %s\n"+
+			"PoolIndex: %d\nSetIndex: %d\nDiskIndex: %d\n"+
+			"DiskInfoCache: %+v\nDiskHealCache: %+v\n"+
+			"RawStorage: %+v\nFSA: %+v\nObj2SlabIdsMap: %+v\n"+
+			"Obj2SlabMap: %+v\nMu: %+v\nSockClient: %+v",
+		s.endpoint,
+		s.restClient,
+		s.diskID,
+		s.poolIndex,
+		s.setIndex,
+		s.diskIndex,
+		s.diskInfoCache,
+		s.diskHealCache,
+		s.rawStorage,
+		s.fsa,
+		s.obj2slabIdsMap,
+		s.obj2SlabMap,
+		s.mu,
+		s.sockClient,
+	)
 }
 
 // Retrieve location indexes.
@@ -358,6 +393,7 @@ func (client *storageRESTClient) DeleteVol(ctx context.Context, volume string, f
 	if forceDelete {
 		values.Set(storageRESTForceDelete, "true")
 	}
+	//fmt.Println("[INFO] DeleteVol, volume=", volume, "forceDelete=", forceDelete)
 	respBody, err := client.call(ctx, storageRESTMethodDeleteVol, values, nil, -1)
 	defer xhttp.DrainBody(respBody)
 	return err
@@ -374,17 +410,162 @@ func (client *storageRESTClient) AppendFile(ctx context.Context, volume string, 
 	return err
 }
 
-func (client *storageRESTClient) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error {
-	values := make(url.Values)
-	values.Set(storageRESTVolume, volume)
-	values.Set(storageRESTFilePath, path)
-	values.Set(storageRESTLength, strconv.Itoa(int(size)))
-	respBody, err := client.call(ctx, storageRESTMethodCreateFile, values, ioutil.NopCloser(reader), size)
-	defer xhttp.DrainBody(respBody)
-	if err != nil {
-		return err
+//func (client *storageRESTClient) mkdirWorker(path string, resultChan chan<- bool) {
+func (client *storageRESTClient) mkdirWorker(path string) {
+	req := Request{Type: byte(MsgMkdir), FilePath: path}
+	_ = client.sockClient.WriteRead(&req)
+
+	//resultChan <- true
+}
+
+func (client *storageRESTClient) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader, bucket string, writeOpt RdioWriteOpt) error {
+	var err error
+	var ete, br time.Time
+	var key string
+
+	object := writeOpt.object
+
+	//fmt.Println("[INFO] CreateFile: volume=", volume, "path=", path, "size=", size, "bucket=", bucket, "object=", object)
+
+	if globalMappingCacheEnable && isRegularBucket(volume) && size != -1 {
+		StartTS(&br)
+		index := strings.Index(path, "/")
+		if index != -1 {
+			partStr := path[index+1:]
+			key = pathJoin(bucket, object, partStr)
+		} else {
+			fmt.Println("[ERROR] Failed to split path")
+		}
+		EndTS(&br, BR_REMOTE_WRITE_CACHE)
 	}
-	_, err = waitForHTTPResponse(respBody)
+
+	if globalIsNvmeofWrite && isRegularBucket(volume) && size != -1 {
+		var flValue FLValue
+		StartTS(&ete)
+
+		if globalFileSlabEnable {
+			flValue = client.fsa.Alloc(int(size))
+			//fmt.Println("[INFO] size=", size, "flValue=", flValue)
+		} else {
+			flValue.id = -1
+		}
+
+		if flValue.id != -1 {
+			StartTS(&br)
+			re := regexp.MustCompile(`part\.(\d+)$`)
+			matches := re.FindStringSubmatch(path)
+			if len(matches) > 1 {
+				partIdStr := matches[1]
+				partId, err := strconv.Atoi(partIdStr)
+				if err != nil {
+				}
+				partId -= 1
+
+				client.obj2SlabMap.Put(object, partId, flValue.id, int(size))
+			}
+			EndTS(&br, BR_REMOTE_WRITE_GET_SLAB)
+
+			if globalMappingCacheEnable && enableCacheDataByWrite {
+				StartTS(&br)
+				value := ExtCacheValue{fileSize: size, extents: flValue.extents}
+				client.rawStorage.cache.Add(key, value)
+				//fmt.Println("[INFO] CreateFile cache key=", key, "value=", value)
+				EndTS(&br, BR_REMOTE_WRITE_CACHE)
+			}
+
+			StartTS(&br)
+			err = PwriteAligned(int(client.rawStorage.devFile.Fd()),
+				size, flValue.extents, reader, writeOpt.isParity)
+			if err != nil {
+				fmt.Printf("[ERROR] Failed to PwriteAligned, object=%s, err=%v\n", object, err)
+				return err
+			}
+			EndTS(&br, BR_REMOTE_WRITE_IO)
+
+			EndTS(&ete, BR_REMOTE_WRITE)
+		} else {
+			StartTS(&br)
+
+			var res RawIOResponse
+			if writeRestAPI {
+				var respBody io.ReadCloser
+				values := make(url.Values)
+				values.Set(storageRESTVolume, volume)
+				values.Set(storageRESTFilePath, path)
+				values.Set(storageRESTLength, strconv.Itoa(int(size)))
+				respBody, err = client.call(ctx, storageRESTMethodCreateFile, values, nil, -1)
+				defer xhttp.DrainBody(respBody)
+				if err != nil {
+					return err
+				}
+				//_, err = waitForHTTPResponse(respBody)
+
+				resp := msgpNewReader(respBody)
+				defer readMsgpReaderPool.Put(resp)
+
+				err = res.DecodeMsg(resp)
+				if err != nil {
+					fmt.Println("[ERROR] Failed to decode response")
+					return err
+				}
+			} else {
+				//if !writeOpt.isParity {
+				req := Request{Type: byte(MsgCreateFile),
+					FilePath: path, Object: object, FileSize: int(size)}
+				res = client.sockClient.WriteRead(&req)
+				//}
+			}
+			EndTS(&br, BR_REMOTE_WRITE_RPC)
+
+			StartTS(&br)
+			err = PwriteAligned(int(client.rawStorage.devFile.Fd()),
+				size, res.Extents, reader, writeOpt.isParity)
+			if err != nil {
+				fmt.Printf("[ERROR] Failed to PwriteAligned, object=%s, err=%v\n", object, err)
+				return err
+			}
+
+			if err != nil {
+				return err
+			}
+			EndTS(&br, BR_REMOTE_WRITE_IO)
+
+			if globalMappingCacheEnable && enableCacheDataByWrite {
+				StartTS(&br)
+				value := ExtCacheValue{fileSize: size, extents: res.Extents}
+				client.rawStorage.cache.Add(key, value)
+				//fmt.Println("[INFO] CreateFile cache add key=", key, "value=", value)
+				EndTS(&br, BR_REMOTE_WRITE_CACHE)
+			}
+			EndTS(&ete, BR_REMOTE_WRITE)
+		}
+	} else {
+		//else if isRegularBucket(volume) && size != -1 && globalIsSDFS {
+		/* for shared disk file system */
+		//	err = client.rawStorage.CreateFileSDFS(ctx, volume, path, size, reader, bucket, object)
+		//}
+
+		if isRegularBucket(volume) && size != -1 {
+			StartTS(&ete)
+		}
+		var respBody io.ReadCloser
+
+		values := make(url.Values)
+		values.Set(storageRESTVolume, volume)
+		values.Set(storageRESTFilePath, path)
+		values.Set(storageRESTLength, strconv.Itoa(int(size)))
+		respBody, err = client.call(ctx, storageRESTMethodCreateFile, values, ioutil.NopCloser(reader), size)
+		defer xhttp.DrainBody(respBody)
+		if err != nil {
+			return err
+		}
+		_, err = waitForHTTPResponse(respBody)
+		//if size != -1
+		if isRegularBucket(volume) && size != -1 {
+			EndTS(&ete, BR_REMOTE_WRITE)
+		}
+	}
+
 	return err
 }
 
@@ -419,6 +600,7 @@ func (client *storageRESTClient) UpdateMetadata(ctx context.Context, volume, pat
 }
 
 func (client *storageRESTClient) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error {
+	//fmt.Println("[INFO] DeleteVersion volume=", volume, "path=", path)
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
@@ -462,21 +644,76 @@ func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, 
 }
 
 // RenameData - rename source path to destination path atomically, metadata and data file.
-func (client *storageRESTClient) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (err error) {
+func (client *storageRESTClient) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, isRemote bool) (err error) {
+	var ete, br time.Time
+
 	values := make(url.Values)
 	values.Set(storageRESTSrcVolume, srcVolume)
 	values.Set(storageRESTSrcPath, srcPath)
 	values.Set(storageRESTDstVolume, dstVolume)
 	values.Set(storageRESTDstPath, dstPath)
 
+	if isRegularBucket(dstVolume) {
+		if globalFileSlabEnable {
+			StartTS(&br)
+			value, ok := client.obj2SlabMap.Get(dstPath)
+			if ok {
+				client.obj2SlabMap.Delete(dstPath)
+
+				valueStr := strings.Join(strings.Fields(fmt.Sprint(value.ids)), ",")
+				values.Set("obj2slabIdsMap", valueStr)
+				values.Set("slabSize", strconv.Itoa(value.size))
+				hostName, _ := os.Hostname()
+				values.Set("hostName", hostName)
+			}
+			EndTS(&br, BR_RENAMEDATA_CLIENT_SLAB)
+		}
+		StartTS(&ete)
+	}
+
 	var reader bytes.Buffer
 	if err = msgp.Encode(&reader, &fi); err != nil {
 		return err
 	}
 
+	var xlKey string
+	if isRegularBucket(dstVolume) && globalMappingCacheEnable {
+		StartTS(&br)
+		xlKey = pathJoin(dstVolume, dstPath)
+		if client.rawStorage == nil {
+			log.Fatalf("FATAL: RenameData metaCache, client.rawStorage is nil", client.String2())
+		}
+		client.rawStorage.metaCache.Remove(xlKey)
+		//fmt.Println("[INFO] RenameData metaCache.Remove() xlKey=", xlKey)
+		EndTS(&br, BR_RENAMEDATA_CACHE)
+	}
 	respBody, err := client.call(ctx, storageRESTMethodRenameData, values, &reader, -1)
 	defer xhttp.DrainBody(respBody)
 
+	if isRegularBucket(dstVolume) && globalMappingCacheEnable && enableCacheMetaByWrite {
+		if err != nil {
+			return err
+		}
+
+		var res RawIOResponse
+		resp := msgpNewReader(respBody)
+		defer readMsgpReaderPool.Put(resp)
+
+		err = res.DecodeMsg(resp)
+		if err != nil {
+			return err
+		}
+
+		StartTS(&br)
+		value := ExtCacheValue{fileSize: int64(res.FileSize),
+			extents: res.Extents, mtime: res.MTime}
+		client.rawStorage.metaCache.Add(xlKey, value)
+		EndTS(&br, BR_RENAMEDATA_CACHE)
+	}
+
+	if isRegularBucket(dstVolume) {
+		EndTS(&ete, BR_RENAMEDATA_REMOTE)
+	}
 	return err
 }
 
@@ -515,22 +752,141 @@ func (client *storageRESTClient) ReadVersion(ctx context.Context, volume, path, 
 	return fi, err
 }
 
+func removeSuffixes(str string) string {
+	suffixes := []string{"_$folder$", "__XLDIR__"}
+
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(str, suffix) {
+			return strings.TrimSuffix(str, suffix)
+		}
+	}
+
+	return str
+}
+
 // ReadXL - reads all contents of xl.meta of a file.
 func (client *storageRESTClient) ReadXL(ctx context.Context, volume string, path string, readData bool) (rf RawFileInfo, err error) {
-	values := make(url.Values)
-	values.Set(storageRESTVolume, volume)
-	values.Set(storageRESTFilePath, path)
-	values.Set(storageRESTReadData, strconv.FormatBool(readData))
-	respBody, err := client.call(ctx, storageRESTMethodReadXL, values, nil, -1)
-	if err != nil {
-		return rf, err
+	var ete time.Time
+	var br time.Time
+
+	if isRegularBucket(volume) && globalIsNvmeofReadXL {
+		StartTS(&ete)
+		var fileSize int64
+		var extents []ExtentInfo
+		var value ExtCacheValue
+		var mtime time.Time
+		var xlKey string
+
+		//fmt.Println("[INFO] ReadXL volume=", volume, "path=", path, "readData=", readData)
+
+		if XLCaching {
+			if globalMappingCacheEnable {
+				StartTS(&br)
+				xlKey = pathJoin(volume, removeSuffixes(path))
+				v, ok := client.rawStorage.metaCache.Get(xlKey)
+				if ok {
+					value = v
+					fileSize = value.fileSize
+					extents = value.extents
+					mtime = value.mtime
+				}
+				EndTS(&br, BR_REMOTE_METADATA_READ_CACHE)
+				//fmt.Println("[INFO] ReadXL:metaCache.Get() xlKey=", xlKey, "value=", v)
+			}
+		}
+
+		if value.extents == nil {
+			StartTS(&br)
+			//fmt.Println("[INFO] ReadXL cache miss, readData=true, volume=", volume, "path(key)=", path)
+			var res RawIOResponse
+			if readXLRestAPI {
+				values := make(url.Values)
+				values.Set(storageRESTVolume, volume)
+				values.Set(storageRESTFilePath, path)
+				values.Set(storageRESTReadData, strconv.FormatBool(readData))
+				respBody, err := client.call(ctx, storageRESTMethodReadXL, values, nil, -1)
+				if err != nil {
+					return rf, err
+				}
+				defer xhttp.DrainBody(respBody)
+
+				resp := msgpNewReader(respBody)
+				defer readMsgpReaderPool.Put(resp)
+
+				err = res.DecodeMsg(resp)
+				if err != nil {
+					fmt.Println("[ERROR] ReadXL: Failed to decode response")
+					return rf, err
+				}
+			} else {
+				req := Request{Type: byte(MsgReadXL),
+					Volume: volume, FilePath: path}
+				res = client.sockClient.WriteRead(&req)
+				if res.Err != "" {
+					return rf, errFileNotFound
+				}
+			}
+			EndTS(&br, BR_REMOTE_METADATA_READ_RPC)
+
+			fileSize = int64(res.FileSize)
+			extents = res.Extents
+			mtime = res.MTime
+
+			if globalParityFreeWrite && extents == nil { // case for failure
+				volumeDir := pathJoin(client.rawStorage.mntpnt, volume)
+				filePath := pathJoin(path, xlStorageFormatFile)
+				fullFilePath := pathJoin(volumeDir, filePath)
+				fileSize, _ = GetExtents(fullFilePath, true, &extents)
+			}
+
+			if XLCaching {
+				if globalMappingCacheEnable {
+					StartTS(&br)
+					value := ExtCacheValue{fileSize: int64(fileSize),
+						extents: extents, mtime: res.MTime}
+					client.rawStorage.metaCache.Add(xlKey, value)
+					EndTS(&br, BR_REMOTE_METADATA_READ_CACHE)
+				}
+			}
+		} else {
+			//fmt.Println("[INFO] ReadXL cache: Get hit key=", xlKey, "value=", value)
+		}
+
+		StartTS(&br)
+		if client.rawStorage == nil {
+			log.Fatalf("FATAL: ReadXL, client.rawStorage is nil", client.String2())
+		}
+		rf, err = PreadXLAligned(int(client.rawStorage.devFile.Fd()), fileSize, extents, mtime)
+		EndTS(&br, BR_REMOTE_METADATA_READ_IO)
+
+		EndTS(&ete, BR_REMOTE_METADATA_READ)
+	} else if isRegularBucket(volume) && globalIsSDFS && readData {
+		/* for shared disk file system */
+		rf, err = client.rawStorage.ReadXLSDFS(ctx, volume, path, readData)
+	} else {
+		if isRegularBucket(volume) {
+			StartTS(&ete)
+		}
+
+		values := make(url.Values)
+		values.Set(storageRESTVolume, volume)
+		values.Set(storageRESTFilePath, path)
+		values.Set(storageRESTReadData, strconv.FormatBool(readData))
+		respBody, err := client.call(ctx, storageRESTMethodReadXL, values, nil, -1)
+		if err != nil {
+			return rf, err
+		}
+		defer xhttp.DrainBody(respBody)
+
+		dec := msgpNewReader(respBody)
+		defer readMsgpReaderPool.Put(dec)
+
+		err = rf.DecodeMsg(dec)
+
+		if isRegularBucket(volume) {
+			EndTS(&ete, BR_REMOTE_METADATA_READ)
+		}
 	}
-	defer xhttp.DrainBody(respBody)
-
-	dec := msgpNewReader(respBody)
-	defer readMsgpReaderPool.Put(dec)
-
-	err = rf.DecodeMsg(dec)
 	return rf, err
 }
 
@@ -549,12 +905,122 @@ func (client *storageRESTClient) ReadAll(ctx context.Context, volume string, pat
 
 // ReadFileStream - returns a reader for the requested file.
 func (client *storageRESTClient) ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error) {
-	values := make(url.Values)
-	values.Set(storageRESTVolume, volume)
-	values.Set(storageRESTFilePath, path)
-	values.Set(storageRESTOffset, strconv.Itoa(int(offset)))
-	values.Set(storageRESTLength, strconv.Itoa(int(length)))
-	respBody, err := client.call(ctx, storageRESTMethodReadFileStream, values, nil, -1)
+	var respBody io.ReadCloser
+	var err error
+
+	var ete time.Time
+	var br time.Time
+
+	/* Only for regular partition */
+	if isRegularBucket(volume) && globalIsNvmeofRead {
+		StartTS(&ete)
+		var fileSize int64
+		var extents []ExtentInfo
+		var value ExtCacheValue
+
+		//fmt.Println("[INFO] ReadFileStream:", volume, path, offset, length)
+
+		var key string
+		if globalMappingCacheEnable {
+			StartTS(&br)
+			//fmt.Println("[INFO] ReadFileStream path=", path)
+			key = pathJoin(volume, path)
+			v, ok := client.rawStorage.cache.Get(key)
+			if ok {
+				value = v
+				fileSize = value.fileSize
+				extents = value.extents
+			}
+			//fmt.Println("[INFO] ReadFileStream cache Get key=", key, "value=", v)
+			EndTS(&br, BR_REMOTE_READ_CACHE)
+		}
+
+		if value.extents == nil {
+			//fmt.Println("[INFO] ReadFileStream cache miss")
+			StartTS(&br)
+
+			var res RawIOResponse
+			if readRestAPI {
+				values := make(url.Values)
+				values.Set(storageRESTVolume, volume)
+				values.Set(storageRESTFilePath, path)
+				values.Set(storageRESTOffset, strconv.Itoa(int(offset)))
+				values.Set(storageRESTLength, strconv.Itoa(int(length)))
+
+				respBody, err = client.call(ctx, storageRESTMethodReadFileStream, values, nil, -1)
+				if err != nil {
+					return respBody, err
+				}
+
+				defer xhttp.DrainBody(respBody)
+
+				resp := msgpNewReader(respBody)
+				defer readMsgpReaderPool.Put(resp)
+
+				err = res.DecodeMsg(resp)
+				if err != nil {
+					return respBody, err
+				}
+			} else {
+				if !globalParityFreeWrite {
+					req := Request{Type: byte(MsgReadFileStream),
+						Volume: volume, FilePath: path}
+					res = client.sockClient.WriteRead(&req)
+				} else {
+				}
+			}
+			EndTS(&br, BR_REMOTE_READ_RPC)
+
+			fileSize = int64(res.FileSize)
+			extents = res.Extents
+
+			/* case for failure: rdevs are already mounted from shell script */
+			if globalParityFreeWrite && extents == nil {
+				volumeDir := pathJoin(client.rawStorage.mntpnt, volume)
+				fullFilePath := pathJoin(volumeDir, path)
+				fileSize, _ = GetExtents(fullFilePath, true, &extents)
+				//fmt.Printf("fullFilePath=%s\n", fullFilePath)
+			}
+
+			if globalMappingCacheEnable {
+				StartTS(&br)
+				value := ExtCacheValue{fileSize: int64(fileSize), extents: extents}
+				client.rawStorage.cache.Add(key, value)
+				EndTS(&br, BR_REMOTE_READ_CACHE)
+			}
+		}
+
+		StartTS(&br)
+		if client.rawStorage == nil {
+			log.Fatalf("FATAL: ReadFileStream client.rawStorage is nil", client.String2())
+		}
+
+		var readCloser io.ReadCloser
+		readCloser, err = PreadAligned3(int(client.rawStorage.devFile.Fd()), fileSize, extents, offset, length) // XXX
+		EndTS(&br, BR_REMOTE_READ_IO)
+
+		EndTS(&ete, BR_REMOTE_READ)
+		return readCloser, err
+	} else if isRegularBucket(volume) && globalIsSDFS {
+		/* for shared disk file system */
+		respBody, err = client.rawStorage.ReadFileStreamSDFS(ctx, volume, path, offset, length)
+	} else {
+		//var startTS time.Time
+		if isRegularBucket(volume) {
+			StartTS(&ete)
+		}
+
+		values := make(url.Values)
+		values.Set(storageRESTVolume, volume)
+		values.Set(storageRESTFilePath, path)
+		values.Set(storageRESTOffset, strconv.Itoa(int(offset)))
+		values.Set(storageRESTLength, strconv.Itoa(int(length)))
+		respBody, err = client.call(ctx, storageRESTMethodReadFileStream, values, nil, -1)
+
+		if isRegularBucket(volume) {
+			EndTS(&ete, BR_REMOTE_READ)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -601,6 +1067,7 @@ func (client *storageRESTClient) ListDir(ctx context.Context, volume, dirPath st
 
 // DeleteFile - deletes a file.
 func (client *storageRESTClient) Delete(ctx context.Context, volume string, path string, recursive bool) error {
+	//fmt.Println("[INFO] Delete volume=", volume, "path=", path, "recursive=", recursive)
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
@@ -616,6 +1083,12 @@ func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume stri
 	if len(versions) == 0 {
 		return errs
 	}
+
+	//if globalMappingCacheEnable && isRegularBucket(volume) {
+	//	fmt.Printf("[WARN] Delete versions..., volume=%s, versions=%s", volume, versions)
+	//	client.rawStorage.cache.Purge()
+	//	client.rawStorage.metaCache.Purge()
+	//}
 
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
@@ -674,6 +1147,9 @@ func (client *storageRESTClient) RenameFile(ctx context.Context, srcVolume, srcP
 	values.Set(storageRESTDstPath, dstPath)
 	respBody, err := client.call(ctx, storageRESTMethodRenameFile, values, nil, -1)
 	defer xhttp.DrainBody(respBody)
+
+	//fmt.Println("[INFO] RenameFile: srcVolume=", srcVolume, "srcPath=", srcPath,
+	//"dstVolume=", dstVolume, "dstPath=", dstPath)
 	return err
 }
 
@@ -738,8 +1214,31 @@ func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path 
 
 // Close - marks the client as closed.
 func (client *storageRESTClient) Close() error {
+	//fmt.Println("[INFO] storageRESTClient Close()")
 	client.restClient.Close()
+	if client.sockClient != nil {
+		client.sockClient.Close()
+	}
+	if client.rawStorage != nil {
+		client.rawStorage.Close()
+	}
 	return nil
+}
+
+var muClientMap sync.Mutex
+
+func (client *storageRESTClient) InitStorageSocketClient() {
+	muClientMap.Lock()
+	globalRESTClientMap[client.endpoint.String()] = client
+	muClientMap.Unlock()
+
+	client.sockClient = newStorageSocketClient(client.endpoint)
+	if client.sockClient == nil {
+		log.Fatalf("FATAL: init. storageSocketClient is nil")
+	}
+	//fmt.Println("[INFO] xl raw initialized, endpoint=", client.endpoint.String(),
+	//	"devPath=", client.rawStorage.devPath, "numFileSlabs=", numFileSlabs)
+
 }
 
 // Returns a storage rest client.
@@ -766,5 +1265,21 @@ func newStorageRESTClient(endpoint Endpoint, healthcheck bool) *storageRESTClien
 		}
 	}
 
-	return &storageRESTClient{endpoint: endpoint, restClient: restClient, poolIndex: -1, setIndex: -1, diskIndex: -1}
+	//fmt.Println("[INFO] newStorageRESTClient=", endpoint.Host, endpoint.Path)
+
+	//return &storageRESTClient{endpoint: endpoint, restClient: restClient, poolIndex: -1, setIndex: -1, diskIndex: -1}
+	client := &storageRESTClient{endpoint: endpoint, restClient: restClient, poolIndex: -1, setIndex: -1, diskIndex: -1}
+
+	if globalIsNvmeofWrite || globalIsNvmeofRead || globalIsNvmeofReadXL {
+		client.InitStorageSocketClient()
+	}
+
+	if globalIsNvmeofWrite || globalIsNvmeofRead || globalIsNvmeofReadXL || globalIsSDFS {
+		client.rawStorage = newXLRawStorage(client.endpoint)
+		if client.rawStorage == nil {
+			log.Fatalf("FATAL: init. rawStorage is nil")
+		}
+	}
+
+	return client
 }

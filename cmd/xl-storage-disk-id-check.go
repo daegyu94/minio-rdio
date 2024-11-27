@@ -316,14 +316,15 @@ func (p *xlStorageDiskIDCheck) AppendFile(ctx context.Context, volume string, pa
 	return p.storage.AppendFile(ctx, volume, path, buf)
 }
 
-func (p *xlStorageDiskIDCheck) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) (err error) {
+func (p *xlStorageDiskIDCheck) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader, bucket string, writeOpt RdioWriteOpt) (err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricCreateFile, volume, path)
 	if err != nil {
 		return err
 	}
 	defer done(&err)
 
-	return p.storage.CreateFile(ctx, volume, path, size, reader)
+	err = p.storage.CreateFile(ctx, volume, path, size, reader, bucket, writeOpt)
+	return err
 }
 
 func (p *xlStorageDiskIDCheck) ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error) {
@@ -346,14 +347,14 @@ func (p *xlStorageDiskIDCheck) RenameFile(ctx context.Context, srcVolume, srcPat
 	return p.storage.RenameFile(ctx, srcVolume, srcPath, dstVolume, dstPath)
 }
 
-func (p *xlStorageDiskIDCheck) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (err error) {
+func (p *xlStorageDiskIDCheck) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, isRemote bool) (err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricRenameData, srcPath, fi.DataDir, dstVolume, dstPath)
 	if err != nil {
 		return err
 	}
 	defer done(&err)
 
-	return p.storage.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath)
+	return p.storage.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, isRemote)
 }
 
 func (p *xlStorageDiskIDCheck) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) (err error) {
@@ -836,3 +837,5 @@ func diskHealthWriter(ctx context.Context, w io.Writer) io.Writer {
 	}
 	return &diskHealthWrapper{w: w, tracker: tracker}
 }
+
+func (d *xlStorageDiskIDCheck) InitStorageSocketClient() {}

@@ -70,7 +70,7 @@ func newStorageAPIWithoutHealthCheck(endpoint Endpoint) (storage StorageAPI, err
 		}
 		return newXLStorageDiskIDCheck(storage), nil
 	}
-
+	//fmt.Println("[WARN] newStorageAPIWithoutHealthCheck ....!!!", endpoint)
 	return newStorageRESTClient(endpoint, false), nil
 }
 
@@ -83,7 +83,7 @@ func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
 		}
 		return newXLStorageDiskIDCheck(storage), nil
 	}
-
+	//fmt.Println("[WARN] newStorageAPI ....!!!", endpoint)
 	return newStorageRESTClient(endpoint, true), nil
 }
 

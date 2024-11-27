@@ -186,11 +186,11 @@ func (d *naughtyDisk) ReadFileStream(ctx context.Context, volume, path string, o
 	return d.disk.ReadFileStream(ctx, volume, path, offset, length)
 }
 
-func (d *naughtyDisk) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error {
+func (d *naughtyDisk) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader, bucket string, writeOpt RdioWriteOpt) error {
 	if err := d.calcError(); err != nil {
 		return err
 	}
-	return d.disk.CreateFile(ctx, volume, path, size, reader)
+	return d.disk.CreateFile(ctx, volume, path, size, reader, bucket, writeOpt)
 }
 
 func (d *naughtyDisk) AppendFile(ctx context.Context, volume string, path string, buf []byte) error {
@@ -200,11 +200,11 @@ func (d *naughtyDisk) AppendFile(ctx context.Context, volume string, path string
 	return d.disk.AppendFile(ctx, volume, path, buf)
 }
 
-func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) error {
+func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, isRemote bool) error {
 	if err := d.calcError(); err != nil {
 		return err
 	}
-	return d.disk.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath)
+	return d.disk.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, isRemote)
 }
 
 func (d *naughtyDisk) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error {

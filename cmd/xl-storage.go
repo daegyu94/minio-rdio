@@ -54,7 +54,9 @@ const (
 	largestFileThreshold = 64 * humanize.MiByte // Optimized for HDDs
 
 	// Small file threshold below which data accompanies metadata from storage layer.
-	smallFileThreshold = 128 * humanize.KiByte // Optimized for NVMe/SSDs
+	//smallFileThreshold = 128 * humanize.KiByte // Optimized for NVMe/SSDs
+	smallFileThreshold = 4 * humanize.KiByte // Optimized for NVMe/SSDs
+	//smallFileThreshold = 1 // Optimized for NVMe/SSDs
 
 	// For hardrives it is possible to set this to a lower value to avoid any
 	// spike in latency. But currently we are simply keeping it optimal for SSDs.
@@ -276,7 +278,7 @@ func newXLStorage(ep Endpoint) (s *xlStorage, err error) {
 		}
 		renameAll(filePath, pathJoin(s.diskPath, minioMetaTmpDeletedBucket, uuid))
 
-		// Create all necessary bucket folders if possible.
+		// //Create all necessary bucket folders if possible.
 		if err = makeFormatErasureMetaVolumes(s); err != nil {
 			return nil, err
 		}
@@ -1229,6 +1231,7 @@ func (s *xlStorage) renameLegacyMetadata(volumeDir, path string) (err error) {
 func (s *xlStorage) readRaw(ctx context.Context, volumeDir, filePath string, readData bool) (buf []byte, dmTime time.Time, err error) {
 	if readData {
 		buf, dmTime, err = s.readAllData(ctx, volumeDir, pathJoin(filePath, xlStorageFormatFile))
+		//fmt.Println("[INFO] readAllData, err=", err, pathJoin(filePath, xlStorageFormatFile))
 	} else {
 		buf, dmTime, err = s.readMetadataWithDMTime(ctx, pathJoin(filePath, xlStorageFormatFile))
 		if err != nil {
@@ -1244,6 +1247,7 @@ func (s *xlStorage) readRaw(ctx context.Context, volumeDir, filePath string, rea
 	if err != nil {
 		if err == errFileNotFound {
 			buf, dmTime, err = s.readAllData(ctx, volumeDir, pathJoin(filePath, xlStorageFormatFileV1))
+			//fmt.Println("[INFO] readAllData2, err=", err, pathJoin(filePath, xlStorageFormatFileV1))
 			if err != nil {
 				return nil, time.Time{}, err
 			}
@@ -1253,6 +1257,7 @@ func (s *xlStorage) readRaw(ctx context.Context, volumeDir, filePath string, rea
 	}
 
 	if len(buf) == 0 {
+		fmt.Println("[INFO] len(buf)=0 err=", err)
 		return nil, time.Time{}, errFileNotFound
 	}
 
@@ -1262,6 +1267,7 @@ func (s *xlStorage) readRaw(ctx context.Context, volumeDir, filePath string, rea
 // ReadXL reads from path/xl.meta, does not interpret the data it read. This
 // is a raw call equivalent of ReadVersion().
 func (s *xlStorage) ReadXL(ctx context.Context, volume, path string, readData bool) (RawFileInfo, error) {
+	//fmt.Printf("[INFO] ReadXL %s, %s\n", volume, path)
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return RawFileInfo{}, err
@@ -1366,8 +1372,14 @@ func (s *xlStorage) readAllData(ctx context.Context, volumeDir string, filePath 
 		return nil, time.Time{}, ctx.Err()
 	}
 
-	f, err := OpenFileDirectIO(filePath, readMode, 0o666)
+	var f *os.File
+	if globalBufferedIO {
+		f, err = OpenFile(filePath, readMode, 0o666)
+	} else {
+		f, err = OpenFileDirectIO(filePath, readMode, 0o666)
+	}
 	if err != nil {
+		//fmt.Println("[INFO] readAllData orig err=", err)
 		if osIsNotExist(err) {
 			// Check if the object doesn't exist because its bucket
 			// is missing in order to return the correct error.
@@ -1398,10 +1410,12 @@ func (s *xlStorage) readAllData(ctx context.Context, volumeDir string, filePath 
 		}
 		return nil, dmTime, err
 	}
+
 	r := &xioutil.ODirectReader{
 		File:      f,
 		SmallFile: true,
 	}
+
 	defer r.Close()
 
 	// Get size for precise allocation.
@@ -1453,6 +1467,9 @@ func (s *xlStorage) ReadAll(ctx context.Context, volume string, path string) (bu
 	}
 
 	buf, _, err = s.readAllData(ctx, volumeDir, filePath)
+	//if err == errFileNotFound {
+	//	fmt.Println("[INFO] readAllData err=", err)
+	//}
 	return buf, err
 }
 
@@ -1656,7 +1673,13 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 		return nil, err
 	}
 
-	file, err := OpenFileDirectIO(filePath, readMode, 0o666)
+	/* XXX: we can provide option for buffered read */
+	var file *os.File
+	if globalBufferedIO {
+		file, err = OpenFile(filePath, readMode, 0o666)
+	} else {
+		file, err = OpenFileDirectIO(filePath, readMode, 0o666)
+	}
 	if err != nil {
 		switch {
 		case osIsNotExist(err):
@@ -1714,34 +1737,46 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 		}
 	}
 
-	or := &xioutil.ODirectReader{
-		File:      file,
-		SmallFile: false,
-	}
+	if globalBufferedIO {
+		// anonymous struct
+		rc := struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.LimitReader(file, length), Closer: file}
 
-	if length <= smallFileThreshold {
-		or = &xioutil.ODirectReader{
+		//fmt.Println("[INFO] ReadFileStream: filePath=", filePath, "volume=", volume, "path=", path, "offset=", offset, "length=", length, "buffered io")
+		return rc, nil
+	} else {
+		or := &xioutil.ODirectReader{
 			File:      file,
-			SmallFile: true,
+			SmallFile: false,
 		}
-	}
 
-	r := struct {
-		io.Reader
-		io.Closer
-	}{Reader: io.LimitReader(diskHealthReader(ctx, or), length), Closer: closeWrapper(func() error {
-		if !alignment || offset+length%xioutil.DirectioAlignSize != 0 {
-			// invalidate page-cache for unaligned reads.
-			if !globalAPIConfig.isDisableODirect() {
-				// skip removing from page-cache only
-				// if O_DIRECT was disabled.
-				disk.FadviseDontNeed(file)
+		if length <= smallFileThreshold {
+			or = &xioutil.ODirectReader{
+				File:      file,
+				SmallFile: true,
 			}
 		}
-		return or.Close()
-	})}
 
-	return r, nil
+		//fmt.Println("[INFO] ReadFileStream: filePath=", filePath, "volume=", volume, "path=", path, "offset=", offset, "length=", length)
+		r := struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.LimitReader(diskHealthReader(ctx, or), length), Closer: closeWrapper(func() error {
+			if !alignment || offset+length%xioutil.DirectioAlignSize != 0 {
+				// invalidate page-cache for unaligned reads.
+				if !globalAPIConfig.isDisableODirect() {
+					// skip removing from page-cache only
+					// if O_DIRECT was disabled.
+					disk.FadviseDontNeed(file)
+				}
+			}
+			return or.Close()
+		})}
+
+		return r, nil
+	}
 }
 
 // closeWrapper converts a function to an io.Closer
@@ -1752,8 +1787,34 @@ func (c closeWrapper) Close() error {
 	return c()
 }
 
+func (s *xlStorage) writeAllDirect(w io.Writer, r io.Reader, totalSize int64, file *os.File) (int64, error) {
+	alignedSize := func(size int) int {
+		const blockSize = 4096
+		if size%blockSize == 0 {
+			return size
+		}
+		return ((size / blockSize) + 1) * blockSize
+	}(int(totalSize))
+
+	totalBuf := make([]byte, alignedSize)
+	nr, err := io.ReadFull(r, totalBuf)
+	eof := err == io.EOF || err == io.ErrUnexpectedEOF
+	if err != nil && !eof {
+		return int64(nr), err
+	}
+
+	n, err := syscall.Write(int(file.Fd()), totalBuf)
+	if err != nil {
+		fmt.Println("[ERROR] Failed to write:", err, "written=", n)
+		return int64(n), err
+	}
+
+	//fmt.Printf("[INFO] writeAllDirect: written=%d, totalBuf size=%d, totalSize=%d\n", n, len(totalBuf), totalSize)
+	return totalSize, nil
+}
+
 // CreateFile - creates the file.
-func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) (err error) {
+func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader, bucket string, writeOpt RdioWriteOpt) (err error) {
 	if fileSize < -1 {
 		return errInvalidArgument
 	}
@@ -1808,27 +1869,60 @@ func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSiz
 		return osErrToFileErr(err)
 	}
 
-	w, err := OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o666)
-	if err != nil {
-		return osErrToFileErr(err)
+	var w *os.File
+	if globalBufferedIO {
+		w, err = OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o666)
+		if err != nil {
+			return osErrToFileErr(err)
+		}
+	} else {
+		w, err = OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o666)
+		if err != nil {
+			return osErrToFileErr(err)
+		}
 	}
 
+	/*
+		if globalParityFreeWrite && writeOpt.isParity {
+			w.Close()
+			return nil
+		}
+	*/
+
 	defer func() {
-		disk.Fdatasync(w) // Only interested in flushing the size_t not mtime/atime
+		if globalIsNvmeofWrite {
+			if enableLocalLazySync {
+				if !isRegularBucket(volume) {
+					disk.Fdatasync(w)
+				}
+			} else {
+				disk.Fdatasync(w)
+			}
+		} else {
+			disk.Fdatasync(w) // Only interested in flushing the size_t not mtime/atime
+		}
 		w.Close()
 	}()
 
 	var bufp *[]byte
-	if fileSize > 0 && fileSize >= largestFileThreshold {
-		// use a larger 4MiB buffer for a really large streams.
-		bufp = xioutil.ODirectPoolXLarge.Get().(*[]byte)
-		defer xioutil.ODirectPoolXLarge.Put(bufp)
-	} else {
-		bufp = xioutil.ODirectPoolLarge.Get().(*[]byte)
-		defer xioutil.ODirectPoolLarge.Put(bufp)
+	if globalBufferedIO == false {
+		if fileSize > 0 && fileSize >= largestFileThreshold {
+			// use a larger 4MiB buffer for a really large streams.
+			bufp = xioutil.ODirectPoolXLarge.Get().(*[]byte)
+			defer xioutil.ODirectPoolXLarge.Put(bufp)
+		} else {
+			bufp = xioutil.ODirectPoolLarge.Get().(*[]byte)
+			defer xioutil.ODirectPoolLarge.Put(bufp)
+		}
 	}
+	//fmt.Println("[INFO] CreateFile: filePath=", filePath, "fileSize=", fileSize, "len(*bufp)=", len(*bufp))
 
-	written, err := xioutil.CopyAligned(diskHealthWriter(ctx, w), r, *bufp, fileSize, w)
+	var written int64
+	if globalBufferedIO {
+		written, err = io.Copy(w, r)
+	} else {
+		written, err = xioutil.CopyAligned(diskHealthWriter(ctx, w), r, *bufp, fileSize, w)
+	}
 	if err != nil {
 		return err
 	}
@@ -1878,6 +1972,49 @@ func (s *xlStorage) writeAll(ctx context.Context, volume string, path string, b 
 
 func (s *xlStorage) WriteAll(ctx context.Context, volume string, path string, b []byte) (err error) {
 	return s.writeAll(ctx, volume, path, b, true)
+}
+
+func (s *xlStorage) WriteAllDirect(ctx context.Context, volume string, path string, b []byte) (err error) {
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return err
+	}
+
+	if err = mkdirAll(pathutil.Dir(filePath), 0o777); err != nil {
+		return osErrToFileErr(err)
+	}
+
+	//fmt.Println("[INFO] filePath=", filePath)
+	w, err := OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o666)
+	if err != nil {
+		fmt.Println("[INFO] WriteAllDirect err", err, filePath)
+		return osErrToFileErr(err)
+	}
+	defer w.Close()
+
+	alignedSize := func(size int) int {
+		const blockSize = 4096
+		if size%blockSize == 0 {
+			return size
+		}
+		return ((size / blockSize) + 1) * blockSize
+	}(int(len(b)))
+
+	totalBuf := make([]byte, alignedSize)
+	copy(totalBuf, b)
+
+	n, err := syscall.Write(int(w.Fd()), totalBuf)
+	if err != nil {
+		fmt.Println("[ERROR] Failed to write:", err, "written=", n)
+		return err
+	}
+
+	return nil
 }
 
 // AppendFile - append a byte array at path, if file doesn't exist at
@@ -2058,7 +2195,12 @@ func skipAccessChecks(volume string) (ok bool) {
 }
 
 // RenameData - rename source path to destination path atomically, metadata and data directory.
-func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (err error) {
+func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, isRemote bool) (err error) {
+	var br time.Time
+	if isRegularBucket(dstVolume) && !isRemote {
+		StartTS(&br)
+	}
+
 	defer func() {
 		if err != nil && !contextCanceled(ctx) {
 			// Only log these errors if context is not yet canceled.
@@ -2084,31 +2226,35 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		return err
 	}
 
-	if !skipAccessChecks(srcVolume) {
-		// Stat a volume entry.
-		if err = Access(srcVolumeDir); err != nil {
-			if osIsNotExist(err) {
-				return errVolumeNotFound
-			} else if isSysErrIO(err) {
-				return errFaultyDisk
+	if !globalFileSlabEnable {
+		if !skipAccessChecks(srcVolume) {
+			// Stat a volume entry.
+			if err = Access(srcVolumeDir); err != nil {
+				if osIsNotExist(err) {
+					return errVolumeNotFound
+				} else if isSysErrIO(err) {
+					return errFaultyDisk
+				}
+				return err
 			}
-			return err
 		}
-	}
 
-	if !skipAccessChecks(dstVolume) {
-		if err = Access(dstVolumeDir); err != nil {
-			if osIsNotExist(err) {
-				return errVolumeNotFound
-			} else if isSysErrIO(err) {
-				return errFaultyDisk
+		if !skipAccessChecks(dstVolume) {
+			if err = Access(dstVolumeDir); err != nil {
+				if osIsNotExist(err) {
+					return errVolumeNotFound
+				} else if isSysErrIO(err) {
+					return errFaultyDisk
+				}
+				return err
 			}
-			return err
 		}
 	}
 
 	srcFilePath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, xlStorageFormatFile))
 	dstFilePath := pathutil.Join(dstVolumeDir, pathJoin(dstPath, xlStorageFormatFile))
+
+	//fmt.Println("[INFO] RenameData srcFilePath=", srcFilePath, "dstFilePath=", dstFilePath)
 
 	var srcDataPath string
 	var dstDataPath string
@@ -2237,7 +2383,6 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			if err = Rename(pathJoin(currentDataPath, entry), pathJoin(legacyDataPath, entry)); err != nil {
 				// Any failed rename calls un-roll previous transaction.
 				s.deleteFile(dstVolumeDir, legacyDataPath, true)
-
 				return osErrToFileErr(err)
 			}
 		}
@@ -2297,14 +2442,47 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		return errFileCorrupt
 	}
 
+	if isRegularBucket(dstVolume) && globalIsNvmeofWrite {
+		//fmt.Printf("[INFO] RenameData, srcVolume=%s, srcPath=%s, dstVolume=%s, dstPath=%s, fi.DataDir=%s\n",
+		//	srcVolume, srcPath, dstVolume, dstPath, fi.DataDir)
+
+		tmpPath := pathJoin(srcVolumeDir, srcPath)
+		tmpDataDirPath := pathJoin(tmpPath, fi.DataDir)
+		tgtPath := pathJoin(dstVolumeDir, dstPath)
+		tgtDataDirPath := pathJoin(tgtPath, fi.DataDir)
+
+		if enableLocalLazySync {
+			if enableAsyncFdatasync {
+				go FdatasyncAll(tmpDataDirPath, tgtDataDirPath) // XXX: async will need recovery
+			} else {
+				FdatasyncAll(tmpDataDirPath, tgtDataDirPath)
+			}
+		} else {
+			if isRemote {
+				if enableAsyncFdatasync {
+					go FdatasyncAll(tmpDataDirPath, tgtDataDirPath) // XXX: async will need recovery
+				} else {
+					FdatasyncAll(tmpDataDirPath, tgtDataDirPath)
+				}
+			}
+		}
+	}
+
 	if srcDataPath != "" {
+		//fmt.Println("[INFO] RenameData srcDataPath not empty ", srcDataPath)
+		//var startTS time.Time
+		//startTS = time.Now()
 		if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
+			//if err = s.WriteAllDirect(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
 				s.deleteFile(dstVolumeDir, legacyDataPath, true)
 			}
+			//fmt.Println("[ERROR] WriteAll err=", err)
 			return osErrToFileErr(err)
 		}
+		//elapsed := time.Since(startTS).Microseconds()
+		//fmt.Println("[INFO] RenameData WriteAll elapsed(us)=", elapsed)
 		diskHealthCheckOK(ctx, err)
 
 		// renameAll only for objects that have xl.meta not saved inline.
@@ -2316,14 +2494,25 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				// on a versioned bucket.
 				s.moveToTrash(legacyDataPath, true)
 			}
+			//fmt.Printf("[INFO] renameAll srcDataPath=%s, dstDataPath=%s\n",
+			//	srcDataPath, dstDataPath)
+			//if false { // XXX: can we separate tmp directory
 			if err = renameAll(srcDataPath, dstDataPath); err != nil {
 				if legacyPreserved {
 					// Any failed rename calls un-roll previous transaction.
 					s.deleteFile(dstVolumeDir, legacyDataPath, true)
 				}
 				s.deleteFile(dstVolumeDir, dstDataPath, false)
-				return osErrToFileErr(err)
+				//fmt.Println("[ERROR] renameAll err=", err, srcDataPath, dstDataPath)
+
+				/* XXX: what's wrong with this? */
+				if isRemote && globalFileSlabEnable && err == errFileNotFound {
+					/* XXX: ignore file not found error */
+				} else {
+					return osErrToFileErr(err)
+				}
 			}
+			//}
 		}
 
 		// Commit meta-file
@@ -2333,6 +2522,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				s.deleteFile(dstVolumeDir, legacyDataPath, true)
 			}
 			s.deleteFile(dstVolumeDir, dstFilePath, false)
+			//fmt.Println("[ERROR] renameAll2 err=", err)
 			return osErrToFileErr(err)
 		}
 
@@ -2350,6 +2540,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				s.deleteFile(dstVolumeDir, legacyDataPath, true)
 			}
 			s.deleteFile(dstVolumeDir, dstFilePath, false)
+			//fmt.Println("[ERROR] WriteAll2 err=", err)
 			return err
 		}
 	}
@@ -2359,6 +2550,10 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	// ideally all transaction should be complete.
 
 	Remove(pathutil.Dir(srcFilePath))
+
+	if isRegularBucket(dstVolume) && !isRemote {
+		EndTS(&br, BR_RENAMEDATA_LOCAL)
+	}
 	return nil
 }
 
@@ -2548,3 +2743,5 @@ func (s *xlStorage) StatInfoFile(ctx context.Context, volume, path string, glob 
 	}
 	return stat, nil
 }
+
+func (d *xlStorage) InitStorageSocketClient() {}

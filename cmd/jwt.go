@@ -25,7 +25,9 @@ import (
 
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	jwtreq "github.com/golang-jwt/jwt/v4/request"
-	lru "github.com/hashicorp/golang-lru"
+
+	//lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/minio/minio/internal/auth"
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
@@ -92,7 +94,8 @@ func cachedAuthenticateNode(ttl time.Duration) func(accessKey, secretKey, audien
 		res     string
 		err     error
 	}
-	cache, err := lru.NewARC(100)
+	//cache, err := lru.NewARC(100)
+	cache, err := lru.New[key, any](100)
 	if err != nil {
 		logger.LogIf(GlobalContext, err)
 		return authenticateNode

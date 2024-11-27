@@ -189,6 +189,7 @@ func findDiskIndex(refFormat, format *formatErasureV3) (int, int, error) {
 // connectDisks - attempt to connect all the endpoints, loads format
 // and re-arranges the disks in proper position.
 func (s *erasureSets) connectDisks() {
+	//fmt.Println("[INFO] connectDisks...!")
 	defer func() {
 		s.lastConnectDisksOpTime = time.Now()
 	}()
@@ -297,6 +298,7 @@ func (s *erasureSets) monitorAndConnectEndpoints(ctx context.Context, monitorInt
 	defer monitor.Stop()
 
 	for {
+		//fmt.Println("[INFO] monitorAndConnectEndpoints...!!!")
 		select {
 		case <-ctx.Done():
 			return
@@ -939,8 +941,16 @@ func (s *erasureSets) GetObjectNInfo(ctx context.Context, bucket, object string,
 
 // PutObject - writes an object to hashedSet based on the object name.
 func (s *erasureSets) PutObject(ctx context.Context, bucket string, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	var ete time.Time
+	if isRegularObject(object) {
+		StartTS(&ete)
+	}
 	set := s.getHashedSet(object)
-	return set.PutObject(ctx, bucket, object, data, opts)
+	objInfo, err = set.PutObject(ctx, bucket, object, data, opts)
+	if isRegularObject(object) {
+		EndTS(&ete, ETE_PUT_OBJECT)
+	}
+	return objInfo, err
 }
 
 // GetObjectInfo - reads object metadata from the hashedSet based on the object name.

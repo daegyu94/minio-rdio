@@ -100,6 +100,11 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			if storageDisk != nil && storageDisk.IsLocal() {
 				localDrives = append(localDrives, storageDisk)
 			}
+
+			//fmt.Println("[INFO] storageDisk=", storageDisk.String())
+			//if storageDisk != nil && !storageDisk.IsLocal() {
+			//	storageDisk.InitStorageSocketClient()
+			//}
 		}
 
 		if deploymentID == "" {
@@ -781,6 +786,7 @@ func (z *erasureServerPools) GetObjectNInfo(ctx context.Context, bucket, object 
 // is present in-case there were duplicate writes to both pools, this function also returns the
 // additional index where the latest object exists, that is used to start the GetObject stream.
 func (z *erasureServerPools) getLatestObjectInfoWithIdx(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, int, error) {
+	//fmt.Println("[INFO] getLatestObjectInfoWithIdx", bucket, object)
 	object = encodeDirObject(object)
 	results := make([]struct {
 		zIdx int
@@ -1080,7 +1086,7 @@ func (z *erasureServerPools) ListObjectsV2(ctx context.Context, bucket, prefix, 
 	if marker == "" {
 		marker = startAfter
 	}
-
+	//fmt.Println("[INFO] ListObjectsV2", bucket, prefix, maxKeys)
 	loi, err := z.ListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 	if err != nil {
 		return ListObjectsV2Info{}, err
@@ -1157,6 +1163,7 @@ func maxKeysPlusOne(maxKeys int, addOne bool) int {
 }
 
 func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
+	//fmt.Println("[INFO] ListObjects", bucket, prefix, maxKeys, delimiter, marker)
 	var loi ListObjectsInfo
 
 	// Automatically remove the object/version is an expiry lifecycle rule can be applied
